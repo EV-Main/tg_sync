@@ -67,6 +67,17 @@
             criticality = "normal";
             entrypoint = [ "/bin/tg_sync" ];
             contents = [ tgSyncBin ];
+            settings = {
+              pkg = "tg_sync";
+              values = {
+                telegram_bot_token = { file = "/secrets/TELEGRAM_BOT_TOKEN"; };
+                discord_bot_token = { file = "/secrets/DISCORD_BOT_TOKEN"; };
+                # `EV Investment`, a forum supergroup; messages from any other chat are ignored.
+                tg_chat_id = -1003901787807;
+                # The `Tg Sync` category in the EV_investment guild.
+                discord_tg_category_id = "1536384231091998781";
+              };
+            };
             env = {
               BIND = "0.0.0.0:55680";
               APP_ENV = "production";
