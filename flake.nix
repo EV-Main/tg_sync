@@ -27,7 +27,7 @@
           enable = true;
           cache = { cachix = "ev-invest"; };
           lastSupportedVersion = "nightly-2026-05-12";
-          containerRelease = { registry = "ghcr.io/ev-main"; };
+          containerRelease = { registry = "ghcr.io/ev-invest"; };
           gitignore.extra = ''
             ## Env
             .env
