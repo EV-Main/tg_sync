@@ -14,7 +14,7 @@
           overlays = [ (import rust-overlay) ];
         };
         # Canonical toolchain pinned in v_flakes — byte-identical across repos, so
-        # the nix store dedups it and sccache cross-references compilations.
+        # the nix store dedups it and kache cross-references compilations.
         rust = v_flakes.rs.default_nightly system;
         # Lean toolchain for the production image build: rustc + cargo + std only.
         rustBuild = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.minimal);
@@ -46,7 +46,7 @@
           version = cargoToml.version;
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
-            # .cargo holds dev-only accelerators (sccache rustc-wrapper) the hermetic
+            # .cargo holds dev-only accelerators (kache rustc-wrapper) the hermetic
             # sandbox lacks — let nix's vendor config drive the build instead.
             filter = path: _type: ! builtins.elem (baseNameOf path) [ "target" ".direnv" ".git" ".cargo" "result" ];
           };
@@ -93,12 +93,11 @@
 
         devShells.default = with pkgs; mkShell {
           shellHook = pre-commit-check.shellHook + combined.shellHook;
-          packages = [ openssl pkg-config clang rust sccache mold treefmt nixpkgs-fmt ]
+          packages = [ openssl pkg-config clang rust mold treefmt nixpkgs-fmt ]
             ++ pre-commit-check.enabledPackages ++ combined.enabledPackages;
           env.RUST_BACKTRACE = 1;
           env.RUST_LIB_BACKTRACE = 0;
           env.DYLD_FALLBACK_LIBRARY_PATH = "${rust}/lib";
-          env.RUSTC_WRAPPER = "sccache";
         };
       }
     );

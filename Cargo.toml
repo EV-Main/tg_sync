@@ -5,6 +5,7 @@ edition = "2024"
 description = "One-way bridge mirroring the EV Telegram supergroup's forum Topics into Discord channels."
 license = "BlueOak-1.0.0"
 publish = false
+repository = "https://github.com/EV-invest/tg_sync"
 
 [dependencies]
 axum = "0.8"
@@ -19,7 +20,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [lints.rust]
+stable_features = "allow"
 unused_features = "allow"
+
+[lints.cargo]
+non_kebab_case_bins = "allow"
+
+[lints.clippy]
+if_not_else = "warn"
+integer_division = "warn"
 
 # smaller target/: trim debuginfo (deps need none), keep line tables for backtraces
 [profile.dev]
