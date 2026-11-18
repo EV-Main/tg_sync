@@ -20,12 +20,17 @@ mod discord;
 mod render;
 mod telegram;
 
+use std::time::Duration;
+
 use channels::{Channels, GENERAL_THREAD_ID};
 use color_eyre::eyre::{Context, Result};
 use config::Config;
 use discord::Discord;
 use telegram::Telegram;
 
+/// ~3 min of back-to-back failure before crashing: long enough to ride out a blip,
+/// short enough that a real outage still surfaces as a restart.
+const MAX_TRANSIENT_FAILURES: u32 = 7;
 fn main() -> Result<()> {
 	color_eyre::install()?;
 	dotenvy::dotenv().ok();
@@ -34,11 +39,15 @@ fn main() -> Result<()> {
 	let config = ev::settings::or_exit(Config::from_env());
 	let _otel_guard = init_tracing(&config.app_env);
 
-	tokio::runtime::Builder::new_multi_thread()
+	let result = tokio::runtime::Builder::new_multi_thread()
 		.enable_all()
 		.build()
 		.context("failed to build tokio runtime")?
-		.block_on(run(config))
+		.block_on(run(config));
+	if let Err(e) = &result {
+		tracing::error!("{e:#}"); // stderr alone never reaches Loki
+	}
+	result
 }
 
 async fn run(config: Config) -> Result<()> {
@@ -68,30 +77,55 @@ async fn mirror(telegram: &Telegram, mut channels: Channels, config: &Config) ->
 	// 0 asks for everything still pending, which after a crash is exactly the
 	// tail that never reached Discord.
 	let mut offset = 0;
+	let mut failures = 0;
 	// Ends by returning an error (crashing the pod, which replays the unconfirmed
 	// tail) or by losing the `select!` in `run` to the shutdown signal.
 	//LOOP: unbounded by design — the poll IS the process's lifetime.
 	loop {
-		for update in telegram.get_updates(offset).await? {
-			let edited = update.message.is_none();
-			match update.message.as_ref().or(update.edited_message.as_ref()) {
-				// The bot only mirrors the one group it was configured for; being added
-				// to another chat must not start creating channels for it.
-				Some(message) if message.chat.id != config.tg_chat_id => {
-					tracing::warn!(chat = message.chat.id, "message from an unconfigured chat — not mirrored")
-				}
-				Some(message) => relay(telegram, &mut channels, config, message, edited).await?,
-				// Structural, not transient: crashing would replay this update forever.
-				// The error reaches Discord through the `tg-sync` alert front instead.
-				None => tracing::error!(update_id = update.update_id, "update carries neither message nor edited_message — skipping"),
+		match drain(telegram, &mut channels, config, &mut offset).await {
+			Ok(()) => failures = 0,
+			// Retrying from the unadvanced offset is the same replay a crash gets, minus the restart.
+			Err(e) if transient(&e) && failures < MAX_TRANSIENT_FAILURES => {
+				failures += 1;
+				let backoff = Duration::from_secs(1 << failures.min(6));
+				tracing::warn!(failures, ?backoff, "transient failure, retrying: {e:#}");
+				tokio::time::sleep(backoff).await;
 			}
-			offset = update.update_id + 1;
+			Err(e) => return Err(e),
 		}
 	}
 }
 
-/// Every failure here propagates: the offset is not advanced, so k8s restarts the
-/// pod and Telegram hands the same message back. Duplicates are bounded; loss is not.
+
+async fn drain(telegram: &Telegram, channels: &mut Channels, config: &Config, offset: &mut i64) -> Result<()> {
+	for update in telegram.get_updates(*offset).await? {
+		let edited = update.message.is_none();
+		match update.message.as_ref().or(update.edited_message.as_ref()) {
+			// The bot only mirrors the one group it was configured for; being added
+			// to another chat must not start creating channels for it.
+			Some(message) if message.chat.id != config.tg_chat_id => {
+				tracing::warn!(chat = message.chat.id, "message from an unconfigured chat — not mirrored")
+			}
+			Some(message) => relay(telegram, channels, config, message, edited).await?,
+			// Structural, not transient: crashing would replay this update forever.
+			// The error reaches Discord through the `tg-sync` alert front instead.
+			None => tracing::error!(update_id = update.update_id, "update carries neither message nor edited_message — skipping"),
+		}
+		*offset = update.update_id + 1;
+	}
+	Ok(())
+}
+
+/// A dropped connection, a timeout, or the far side's 5xx/429 — nothing a restart would fix sooner.
+fn transient(e: &color_eyre::Report) -> bool {
+	e.chain().filter_map(|c| c.downcast_ref::<reqwest::Error>()).any(|e| match e.status() {
+		Some(status) => status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS,
+		None => !e.is_builder(),
+	})
+}
+
+/// Every failure here propagates: the offset is not advanced, so Telegram hands the
+/// same message back, to the retry or to the restarted pod. Duplicates are bounded; loss is not.
 ///
 // ponytail: a message Discord rejects *permanently* (a 400 no retry can fix)
 // crashloops forever instead of advancing — the deliberate price of "never drop".

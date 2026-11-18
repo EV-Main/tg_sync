@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use color_eyre::eyre::{Result, bail, eyre};
+use color_eyre::eyre::{Result, eyre};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +84,7 @@ pub struct FileMeta {
 
 pub struct Telegram {
 	http: reqwest::Client,
+	api: String,
 	token: String,
 	poll_timeout: u64,
 }
@@ -92,7 +93,7 @@ impl Telegram {
 		// The long poll holds the connection for `poll_timeout`; the client budget
 		// must clear it or every idle poll would look like a network failure.
 		let http = reqwest::Client::builder().timeout(Duration::from_secs(poll_timeout + 35)).build()?;
-		Ok(Self { http, token, poll_timeout })
+		Ok(Self { http, api: "https://api.telegram.org".to_string(), token, poll_timeout })
 	}
 
 	/// Long-poll. `offset` doubles as the acknowledgement: Telegram drops every
@@ -117,12 +118,14 @@ impl Telegram {
 		let path = file.file_path.ok_or_else(|| eyre!("getFile returned no file_path for {file_id}"))?;
 		let bytes = self
 			.http
-			.get(format!("https://api.telegram.org/file/bot{}/{path}", self.token))
+			.get(format!("{}/file/bot{}/{path}", self.api, self.token))
 			.send()
-			.await?
-			.error_for_status()?
+			.await
+			.and_then(reqwest::Response::error_for_status)
+			.map_err(reqwest::Error::without_url)?
 			.bytes()
-			.await?;
+			.await
+			.map_err(reqwest::Error::without_url)?;
 		Ok(bytes.to_vec())
 	}
 
@@ -130,12 +133,21 @@ impl Telegram {
 	/// whose `description` is the only thing that says *why* (a revoked token, a
 	/// second poller holding the same offset, a file over 20 MB).
 	async fn call<T: serde::de::DeserializeOwned>(&self, method: &str, body: &serde_json::Value) -> Result<T> {
-		let response = self.http.post(format!("https://api.telegram.org/bot{}/{method}", self.token)).json(body).send().await?;
+		let response = self.http.post(format!("{}/bot{}/{method}", self.api, self.token)).json(body).send().await.map_err(reqwest::Error::without_url)?;
 		let status = response.status();
-		let text = response.text().await?;
-		let parsed: ApiResponse<T> = serde_json::from_str(&text).map_err(|e| eyre!("telegram {method} returned an unparseable body (status {status}): {e}: {text}"))?;
+		// Keeps a 5xx/429 recognisable to `crate::transient` under the description.
+		let status_error = response.error_for_status_ref().err().map(reqwest::Error::without_url);
+		let text = response.text().await.map_err(reqwest::Error::without_url)?;
+		let fail = |message: String| match status_error {
+			Some(e) => color_eyre::Report::new(e).wrap_err(message),
+			None => eyre!(message),
+		};
+		let parsed: ApiResponse<T> = match serde_json::from_str(&text) {
+			Ok(parsed) => parsed,
+			Err(e) => return Err(fail(format!("telegram {method} returned an unparseable body (status {status}): {e}: {text}"))),
+		};
 		if !parsed.ok {
-			bail!("telegram {method} failed (status {status}): {}", parsed.description.unwrap_or_default());
+			return Err(fail(format!("telegram {method} failed (status {status}): {}", parsed.description.unwrap_or_default())));
 		}
 		parsed.result.ok_or_else(|| eyre!("telegram {method} returned ok without a result"))
 	}
@@ -151,4 +163,47 @@ struct ApiResponse<T> {
 #[derive(Deserialize)]
 struct File {
 	file_path: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	use super::*;
+
+	/// Answers one request per scripted reply; `None` drops the connection mid-request.
+	async fn telegram_answering(replies: Vec<Option<&'static str>>) -> (Telegram, impl Future<Output = ()>) {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let api = format!("http://{}", listener.local_addr().unwrap());
+		let server = async move {
+			for reply in replies {
+				let (mut socket, _) = listener.accept().await.unwrap();
+				socket.read(&mut [0u8; 4096]).await.unwrap();
+				if let Some(reply) = reply {
+					socket.write_all(reply.as_bytes()).await.unwrap();
+				}
+			}
+		};
+		(Telegram { api, ..Telegram::try_new("TOKEN".to_string(), 0).unwrap() }, server)
+	}
+
+	#[tokio::test]
+	async fn only_a_network_blip_or_a_telegram_outage_is_transient() {
+		let (telegram, server) = telegram_answering(vec![
+			None,
+			Some("HTTP/1.1 502 Bad Gateway\r\ncontent-length: 5\r\n\r\nnginx"),
+			Some("HTTP/1.1 401 Unauthorized\r\ncontent-length: 41\r\n\r\n{\"ok\":false,\"description\":\"Unauthorized\"}"),
+		])
+		.await;
+		let client = async {
+			let reset = telegram.get_updates(0).await.unwrap_err();
+			assert!(crate::transient(&reset), "{reset:?}");
+			assert!(!format!("{reset:?}").contains("TOKEN"), "the bot token leaked into {reset:?}");
+			let outage = telegram.get_updates(0).await.unwrap_err();
+			assert!(crate::transient(&outage), "{outage:?}");
+			let revoked = telegram.get_updates(0).await.unwrap_err();
+			assert!(!crate::transient(&revoked), "{revoked:?}");
+		};
+		tokio::join!(server, client);
+	}
 }

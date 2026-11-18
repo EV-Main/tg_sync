@@ -106,12 +106,14 @@ impl Discord {
 	/// rebuilt per attempt because a multipart body is consumed by `send`.
 	async fn execute<F: Fn() -> reqwest::RequestBuilder>(&self, build: F) -> Result<String> {
 		for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
-			let response = build().send().await?;
+			// A webhook URL is its own credential, so it must never reach an error message.
+			let response = build().send().await.map_err(reqwest::Error::without_url)?;
 			let status = response.status();
-			let text = response.text().await?;
+			let status_error = response.error_for_status_ref().err().map(reqwest::Error::without_url);
+			let text = response.text().await.map_err(reqwest::Error::without_url)?;
 			if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
-				if !status.is_success() {
-					bail!("discord rejected the request (status {status}): {text}");
+				if let Some(e) = status_error {
+					return Err(color_eyre::Report::new(e).wrap_err(format!("discord rejected the request (status {status}): {text}")));
 				}
 				return Ok(text);
 			}
