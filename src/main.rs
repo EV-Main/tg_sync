@@ -22,7 +22,9 @@ mod telegram;
 
 use channels::{Channels, GENERAL_THREAD_ID};
 use color_eyre::eyre::{Context, Result};
-use config::Config;
+use clap::Parser;
+use config::{LiveSettings, SettingsFlags};
+use secrecy::ExposeSecret;
 use discord::Discord;
 use telegram::Telegram;
 
@@ -30,22 +32,34 @@ fn main() -> Result<()> {
 	color_eyre::install()?;
 	dotenvy::dotenv().ok();
 
-	// Exits 78 (EX_CONFIG) on a bad environment: a restart cannot help.
-	let config = ev::settings::or_exit(Config::from_env());
-	let _otel_guard = init_tracing(&config.app_env);
+	let cli = Cli::parse();
+	let live = v_utils::utils::exit_on_error(LiveSettings::new(cli.settings, std::time::Duration::from_secs(5)));
+	let app_env = match std::env::var("APP_ENV") {
+		Ok(app_env) => app_env,
+		Err(std::env::VarError::NotPresent) => "development".to_owned(),
+		Err(e) => panic!("APP_ENV: {e}"),
+	};
+	let _otel_guard = init_tracing(&app_env);
 
 	tokio::runtime::Builder::new_multi_thread()
 		.enable_all()
 		.build()
 		.context("failed to build tokio runtime")?
-		.block_on(run(config))
+		.block_on(run(live))
 }
 
-async fn run(config: Config) -> Result<()> {
-	let telegram = Telegram::try_new(config.telegram_bot_token.clone(), config.tg_poll_timeout_secs)?;
+#[derive(Parser)]
+struct Cli {
+	#[command(flatten)]
+	settings: SettingsFlags,
+}
+
+async fn run(live: LiveSettings) -> Result<()> {
+	let config = v_utils::utils::exit_on_error(live.config());
+	let telegram = Telegram::try_new(config.telegram_bot_token.expose_secret().to_owned(), config.tg_poll_timeout_secs)?;
 	// Resolving the category here means a bad id, a revoked Discord token or a
 	// missing permission fails the boot instead of the first message.
-	let channels = Channels::try_new(Discord::try_new(config.discord_bot_token.clone())?, config.discord_tg_category_id.clone())
+	let channels = Channels::try_new(Discord::try_new(config.discord_bot_token.expose_secret().to_owned())?, config.discord_tg_category_id.clone())
 		.await
 		.context("failed to open the Discord mirror category")?;
 
@@ -57,14 +71,13 @@ async fn run(config: Config) -> Result<()> {
 	// simply replayed by the next pod, which is the same guarantee a crash gets.
 	tokio::select! {
 		result = health => result.context("health server error")?,
-		result = mirror(&telegram, channels, &config) => result?,
+		result = mirror(&telegram, channels, &live) => result?,
 		_ = await_signal() => tracing::info!("shutdown signal received"),
-		never = Config::watch_drift() => match never {},
 	}
 	Ok(())
 }
 
-async fn mirror(telegram: &Telegram, mut channels: Channels, config: &Config) -> Result<()> {
+async fn mirror(telegram: &Telegram, mut channels: Channels, live: &LiveSettings) -> Result<()> {
 	// 0 asks for everything still pending, which after a crash is exactly the
 	// tail that never reached Discord.
 	let mut offset = 0;
@@ -72,7 +85,9 @@ async fn mirror(telegram: &Telegram, mut channels: Channels, config: &Config) ->
 	// tail) or by losing the `select!` in `run` to the shutdown signal.
 	//LOOP: unbounded by design — the poll IS the process's lifetime.
 	loop {
-		for update in telegram.get_updates(offset).await? {
+		let updates = telegram.get_updates(offset).await?;
+		let config = live.config().context("failed to reload settings")?;
+		for update in updates {
 			let edited = update.message.is_none();
 			match update.message.as_ref().or(update.edited_message.as_ref()) {
 				// The bot only mirrors the one group it was configured for; being added
@@ -80,7 +95,7 @@ async fn mirror(telegram: &Telegram, mut channels: Channels, config: &Config) ->
 				Some(message) if message.chat.id != config.tg_chat_id => {
 					tracing::warn!(chat = message.chat.id, "message from an unconfigured chat — not mirrored")
 				}
-				Some(message) => relay(telegram, &mut channels, config, message, edited).await?,
+				Some(message) => relay(telegram, &mut channels, config.tg_media_max_bytes, message, edited).await?,
 				// Structural, not transient: crashing would replay this update forever.
 				// The error reaches Discord through the `tg-sync` alert front instead.
 				None => tracing::error!(update_id = update.update_id, "update carries neither message nor edited_message — skipping"),
@@ -97,8 +112,8 @@ async fn mirror(telegram: &Telegram, mut channels: Channels, config: &Config) ->
 // crashloops forever instead of advancing — the deliberate price of "never drop".
 // The tg-sync alert front is what surfaces it; add a poison-message quarantine
 // channel only once one actually shows up.
-async fn relay(telegram: &Telegram, channels: &mut Channels, config: &Config, message: &telegram::Message, edited: bool) -> Result<()> {
-	let post = render::render(message, edited, config.tg_media_max_bytes);
+async fn relay(telegram: &Telegram, channels: &mut Channels, media_max_bytes: u64, message: &telegram::Message, edited: bool) -> Result<()> {
+	let post = render::render(message, edited, media_max_bytes);
 	assert!(!post.chunks.is_empty(), "render always emits the source subtext line");
 
 	let bytes = match &post.file {

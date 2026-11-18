@@ -8,15 +8,18 @@ publish = false
 
 [dependencies]
 axum = "0.8"
+clap = { version = "4", features = ["derive"] }
 color-eyre = "0.6"
 dotenvy = "0.15"
-ev = { version = "0.23.0", package = "ev_lib", default-features = false, features = ["otel", "settings_drift"] }
+ev = { version = "0.23.0", package = "ev_lib", default-features = false, features = ["otel"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "multipart"] }
+secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+v_utils = { version = "3.0.0", features = ["cli", "xdg"] }
 
 [lints.rust]
 unused_features = "allow"
